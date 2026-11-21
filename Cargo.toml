@@ -1,0 +1,34 @@
+[package]
+name = "swf2es-tessellate"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "Apache-2.0"
+description = "lyon's fill tessellator as a no_std wasm32 static library for swf2es's render WebAssembly"
+repository = "https://github.com/swf2es/tessellate"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+doctest = false
+
+[dependencies]
+lyon_tessellation = { version = "=1.0.23", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = true
+
+# A no_std staticlib has no unwinding to offer.
+[profile.dev]
+panic = "abort"
+
+# The tests run lyon as the release build does: without its debug assertions.
+[profile.test]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
