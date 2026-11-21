@@ -116,7 +116,7 @@ fn check_coverage(contours: &[Vec<[f64; 2]>], nonzero: bool, t: &Triangles, step
 
 fn tessellate(contours: &[Vec<[f64; 2]>], nonzero: bool) -> Triangles {
     let (coords, ends) = join(contours);
-    fill(&coords, &ends, nonzero).expect("filled")
+    fill(&coords, &ends, nonzero, 0).expect("filled")
 }
 
 fn square(x: f64, y: f64, side: f64) -> Vec<[f64; 2]> {
@@ -234,15 +234,15 @@ fn refuses_what_is_not_finite_or_in_range() {
     ] {
         let mut coords = good;
         coords[3] = bad;
-        assert_eq!(fill(&coords, &[3], false).unwrap_err(), REFUSED, "{bad}");
+        assert_eq!(fill(&coords, &[3], false, 0).unwrap_err(), REFUSED, "{bad}");
     }
 
     // The widest box twips reach is taken, and so is one far from the origin.
     let mut coords = good;
     coords[2] = 1_677_720.0;
-    assert!(fill(&coords, &[3], false).is_ok());
+    assert!(fill(&coords, &[3], false, 0).is_ok());
     let far = good.map(|v| v + 1e9);
-    let t = fill(&far, &[3], false).unwrap();
+    let t = fill(&far, &[3], false, 0).unwrap();
     assert!(t.positions.iter().all(|&p| (p as f64 - 1e9).abs() <= 128.0));
 }
 
@@ -274,81 +274,94 @@ fn fills_converging_decks_anywhere() {
 fn refuses_ends_that_do_not_close_the_points() {
     let coords = [0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0];
     for ends in [&[][..], &[3], &[5], &[2, 2, 4], &[3, 2], &[0, 4]] {
-        assert_eq!(fill(&coords, ends, false).unwrap_err(), REFUSED, "{ends:?}");
+        assert_eq!(
+            fill(&coords, ends, false, 0).unwrap_err(),
+            REFUSED,
+            "{ends:?}"
+        );
     }
 
-    assert_eq!(fill(&coords[..7], &[3], false).unwrap_err(), REFUSED);
-    assert!(fill(&coords, &[4], false).is_ok());
-    assert!(fill(&coords, &[1, 4], false).is_ok());
+    assert_eq!(fill(&coords[..7], &[3], false, 0).unwrap_err(), REFUSED);
+    assert!(fill(&coords, &[4], false, 0).is_ok());
+    assert!(fill(&coords, &[1, 4], false, 0).is_ok());
 }
 
 #[test]
 fn the_c_function_checks_its_arguments() {
     let coords = [0.0, 0.0, 10.0, 0.0, 10.0, 10.0];
     let ends = [3u32];
-    let mut positions: *const f32 = core::ptr::null();
-    let mut vertices = 0;
-    let mut indices: *const u32 = core::ptr::null();
-    let mut index_count = 0;
-    let call = |count, contours, nonzero, p: &mut _, v: &mut _, i: &mut _, n: &mut _| unsafe {
-        lyon_fill(
-            coords.as_ptr(),
-            count,
-            ends.as_ptr(),
-            contours,
-            nonzero,
-            p,
-            v,
-            i,
-            n,
-        )
+    let call = |count: usize, contours: usize, nonzero: i32, flags: i32| {
+        let mut positions: *const f32 = core::ptr::null();
+        let mut vertices = 0;
+        let mut indices: *const u32 = core::ptr::null();
+        let mut index_count = 0;
+        let status = unsafe {
+            lyon_fill(
+                coords.as_ptr(),
+                count,
+                ends.as_ptr(),
+                contours,
+                nonzero,
+                flags,
+                &mut positions,
+                &mut vertices,
+                &mut indices,
+                &mut index_count,
+            )
+        };
+        (status, positions, vertices, indices, index_count)
     };
-    for (count, contours, nonzero) in [(3, 1, 2), (3, 1, -1), (2, 3, 0), (MOST_POINTS + 1, 1, 0)] {
-        let status = call(
-            count,
-            contours,
-            nonzero,
-            &mut positions,
-            &mut vertices,
-            &mut indices,
-            &mut index_count,
-        );
+    for (count, contours, nonzero, flags) in [
+        (3, 1, 2, 0),
+        (3, 1, -1, 0),
+        (3, 1, 0, 2),
+        (3, 1, 0, -1),
+        (2, 3, 0, 0),
+        (MOST_POINTS + 1, 1, 0, 0),
+    ] {
+        let (status, positions, ..) = call(count, contours, nonzero, flags);
         assert_eq!(status, REFUSED);
         assert!(positions.is_null());
     }
 
-    let status = call(
-        3,
-        1,
-        1,
-        &mut positions,
-        &mut vertices,
-        &mut indices,
-        &mut index_count,
-    );
-    assert_eq!(status, OK);
-    assert_eq!((vertices, index_count), (3, 3));
-    let positions = unsafe { core::slice::from_raw_parts(positions, vertices * 2) };
-    let indices = unsafe { core::slice::from_raw_parts(indices, index_count) };
-    let mut sorted = indices.to_vec();
-    sorted.sort();
-    assert_eq!(sorted, [0, 1, 2]);
-    let mut points: Vec<[f32; 2]> = positions.chunks_exact(2).map(|p| [p[0], p[1]]).collect();
-    points.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    assert_eq!(points, [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0]]);
+    for flags in [0, HORIZONTAL] {
+        let (status, positions, vertices, indices, index_count) = call(3, 1, 1, flags);
+        assert_eq!(status, OK);
+        assert_eq!((vertices, index_count), (3, 3));
+        let positions = unsafe { core::slice::from_raw_parts(positions, vertices * 2) };
+        let indices = unsafe { core::slice::from_raw_parts(indices, index_count) };
+        let mut sorted = indices.to_vec();
+        sorted.sort();
+        assert_eq!(sorted, [0, 1, 2]);
+        let mut points: Vec<[f32; 2]> = positions.chunks_exact(2).map(|p| [p[0], p[1]]).collect();
+        points.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(points, [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0]]);
+    }
 }
 
-/// A sliver whose first edge is a hundredth of a pixel long: lyon's absolute epsilons lose it
-/// filled in pixels, which is why the crate fills in twips.
 #[test]
 fn keeps_a_sub_pixel_sliver() {
     let contours = [vec![[0.0, 0.0], [0.01, 0.003], [100.0, 60.0]]];
     let (coords, ends) = join(&contours);
     let expected = (0.01 * 60.0 - 0.003 * 100.0) / 2.0;
-    let twips = fill(&coords, &ends, false).unwrap();
+    let twips = fill(&coords, &ends, false, 0).unwrap();
     assert!((area(&twips) - expected).abs() < 1e-3 * expected);
-    let pixels = fill_at(&coords, &ends, false, 1.0, false).unwrap();
+    let pixels = fill_at(&coords, &ends, false, 1.0, false, 0).unwrap();
     assert!(area(&pixels) < expected / 2.0, "{}", area(&pixels));
-    let centred_pixels = fill_at(&coords, &ends, false, 1.0, true).unwrap();
+    let centred_pixels = fill_at(&coords, &ends, false, 1.0, true, 0).unwrap();
     assert!(area(&centred_pixels) < expected / 2.0);
+}
+
+/// A deck of 95 contours a hundredth of a pixel apart, as a real morph's are at some ratios: the
+/// sweep along x fills it right wherever it is, by either rule.
+#[test]
+fn a_sweep_along_x_fills_a_large_converging_deck() {
+    for (turn, centre) in [(1e-5, 400.0), (1e-4, 3000.0), (1e-3, 400.0)] {
+        let contours = deck_at(95, 200, turn, centre);
+        let (coords, ends) = join(&contours);
+        for nonzero in [false, true] {
+            let t = fill(&coords, &ends, nonzero, HORIZONTAL).expect("filled");
+            check_coverage(&contours, nonzero, &t, 40);
+        }
+    }
 }

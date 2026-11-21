@@ -28,7 +28,10 @@ use lyon_tessellation::{
 /// sub-pixel slivers, while far from the origin f32 keeps too few of a coordinate's bits. A twip
 /// is a whole number in f32 up to `LIMIT`.
 const SCALE: f64 = 20.0;
-/// The largest coordinate, scaled about the centre, that f32 holds every whole number up to.
+/// The largest coordinate taken, scaled about the centre: f32 holds every whole number up to it.
+/// About a centre that falls between twips, a point of whole twips lies at a half twip, which
+/// f32 holds only up to half of it, 2^23 twips, about 419,430 px: past that, points round by
+/// up to half a twip.
 const LIMIT: f64 = 16_777_216.0;
 /// The largest coordinate taken at all, so that every position given back is a finite f32.
 const FARTHEST: f64 = 1e30;
@@ -189,10 +192,18 @@ fn closes(ends: &[u32], count: usize) -> bool {
     start == count
 }
 
+/// `lyon_fill`'s flags: lyon's sweep along x rather than y.
+pub const HORIZONTAL: i32 = 1;
+
 /// Fills the contours of `coords`, x and y a point, each ending at its point in `ends`, under the
-/// non-zero rule or else the even-odd one. Errors are the status codes.
-pub fn fill(coords: &[f64], ends: &[u32], nonzero: bool) -> Result<Triangles, i32> {
-    fill_at(coords, ends, nonzero, SCALE, true)
+/// non-zero rule or else the even-odd one, as `flags` (`HORIZONTAL`) ask. Errors are the status
+/// codes.
+///
+/// The sweep's direction matters to contours that come within thousandths of a pixel of each
+/// other: lyon can fill those wrongly one way and rightly the other, so a host that checks the
+/// triangles can try the other way before giving up on lyon.
+pub fn fill(coords: &[f64], ends: &[u32], nonzero: bool, flags: i32) -> Result<Triangles, i32> {
+    fill_at(coords, ends, nonzero, SCALE, true, flags)
 }
 
 fn fill_at(
@@ -201,7 +212,12 @@ fn fill_at(
     nonzero: bool,
     scale: f64,
     centred: bool,
+    flags: i32,
 ) -> Result<Triangles, i32> {
+    if flags & !HORIZONTAL != 0 {
+        return Err(REFUSED);
+    }
+
     let count = coords.len() / 2;
     if coords.len() % 2 != 0 || count > MOST_POINTS || !closes(ends, count) {
         return Err(REFUSED);
@@ -229,8 +245,7 @@ fn fill_at(
     let mut points: Vec<Point> = Vec::new();
     points.try_reserve_exact(count).map_err(|_| NO_MEMORY)?;
     for pair in coords.chunks_exact(2) {
-        let x = (pair[0] - cx) * scale;
-        let y = (pair[1] - cy) * scale;
+        let (x, y) = ((pair[0] - cx) * scale, (pair[1] - cy) * scale);
         if !(x.abs() <= LIMIT && y.abs() <= LIMIT) {
             return Err(REFUSED);
         }
@@ -262,7 +277,13 @@ fn fill_at(
         FillRule::EvenOdd
     };
     // The tolerance flattens curves, and the contours have none.
-    let options = FillOptions::tolerance(0.02).with_fill_rule(rule);
+    let options = FillOptions::tolerance(0.02)
+        .with_fill_rule(rule)
+        .with_sweep_orientation(if flags & HORIZONTAL != 0 {
+            lyon_tessellation::Orientation::Horizontal
+        } else {
+            lyon_tessellation::Orientation::Vertical
+        });
     let mut builder = BuffersBuilder::new(
         &mut output,
         Unscaled {
@@ -292,7 +313,8 @@ fn fill_at(
 }
 
 /// Fills `count` points at `coords`, x and y each, as contours ending at the `contours` indices
-/// at `ends`, under the non-zero rule where `nonzero` is 1 and the even-odd one where 0.
+/// at `ends`, under the non-zero rule where `nonzero` is 1 and the even-odd one where 0, as
+/// `flags` ask: `HORIZONTAL` (1) for lyon's sweep along x rather than y.
 ///
 /// Returns `OK` with `*positions` pointing at `*vertices` pairs of f32s and `*indices` at
 /// `*index_count` u32s, three a triangle, all from the allocator and never freed here; or
@@ -309,12 +331,17 @@ pub unsafe extern "C" fn lyon_fill(
     ends: *const u32,
     contours: usize,
     nonzero: i32,
+    flags: i32,
     positions: *mut *const f32,
     vertices: *mut usize,
     indices: *mut *const u32,
     index_count: *mut usize,
 ) -> i32 {
-    if count > MOST_POINTS || contours > count || !(nonzero == 0 || nonzero == 1) {
+    if count > MOST_POINTS
+        || contours > count
+        || !(nonzero == 0 || nonzero == 1)
+        || flags & !HORIZONTAL != 0
+    {
         return REFUSED;
     }
 
@@ -332,7 +359,7 @@ pub unsafe extern "C" fn lyon_fill(
             )
         }
     };
-    match fill(coords, ends, nonzero == 1) {
+    match fill(coords, ends, nonzero == 1, flags) {
         Ok(triangles) => {
             let triangles = core::mem::ManuallyDrop::new(triangles);
             unsafe {

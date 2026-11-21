@@ -11,7 +11,7 @@ one another densely, as a morph of near-identical outlines does.
 ```c
 int32_t lyon_fill(const double *coords, size_t count,
                   const uint32_t *ends, size_t contours,
-                  int32_t nonzero,
+                  int32_t nonzero, int32_t flags,
                   const float **positions, size_t *vertices,
                   const uint32_t **indices, size_t *index_count);
 ```
@@ -20,12 +20,16 @@ int32_t lyon_fill(const double *coords, size_t count,
   each ending at its point in `ends` (the last end is `count`), each of one
   point or more; every contour is closed back to its first point.
 - `nonzero` is 1 for the non-zero rule and 0 for the even-odd one.
+- `flags` is 0, or 1 (`HORIZONTAL`) for lyon's sweep to go along x rather
+  than y. Contours that come within thousandths of a pixel of each other can
+  come out wrong one way and right the other, so a host that checks the
+  triangles, as swf2es does, can try the other way before giving up on lyon.
 - On success it returns 0, with `*positions` pointing at `*vertices` pairs of
   f32s and `*indices` at `*index_count` u32s, three a triangle.
 - Otherwise it returns -1 where lyon could not fill the contours, -2 where it
   refused the input (a coordinate not finite, past ±1e30 or more than
   838,860.8 from the centre of the points' box, `ends` that do not close the
-  points, a rule other than 0 or 1), or -3 where memory for the crate's own
+  points, a rule or flags other than 0 or 1), or -3 where memory for the crate's own
   buffers (the points and the output's first reservation) ran out; the outputs
   are left alone. An allocation lyon makes itself that fails traps instead,
   as a panic does (below): -3 does not cover running out of memory in lyon.
