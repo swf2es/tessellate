@@ -7,7 +7,9 @@
 //! before each call, so nothing here is ever freed one allocation at a time.
 //!
 //! Failures are returned as status codes. A panic inside lyon, which this crate's own checks are
-//! there to prevent, traps on wasm32 (`unreachable`), and the host discards the instance.
+//! there to prevent, traps on wasm32 (`unreachable`), and so does an allocation lyon makes that
+//! fails: only the crate's own buffers report running out (`NO_MEMORY`). The host then discards
+//! the instance.
 #![no_std]
 extern crate alloc;
 #[cfg(test)]
@@ -21,12 +23,15 @@ use lyon_tessellation::{
     VertexBuffers,
 };
 
-/// The fill is tessellated in twentieths of the input's unit, twips where the input is pixels:
-/// lyon's epsilons are absolute, and at pixel scale they drop sub-pixel slivers. A twip is a
-/// whole number in f32 up to `LIMIT`.
+/// The fill is tessellated in twentieths of the input's unit, twips where the input is pixels,
+/// about the centre of its box: lyon's epsilons are absolute, and at pixel scale they drop
+/// sub-pixel slivers, while far from the origin f32 keeps too few of a coordinate's bits. A twip
+/// is a whole number in f32 up to `LIMIT`.
 const SCALE: f64 = 20.0;
-/// The largest coordinate, after scaling, that f32 holds every whole number up to.
+/// The largest coordinate, scaled about the centre, that f32 holds every whole number up to.
 const LIMIT: f64 = 16_777_216.0;
+/// The largest coordinate taken at all, so that every position given back is a finite f32.
+const FARTHEST: f64 = 1e30;
 /// The most points one call takes, which keeps every size below in range.
 pub const MOST_POINTS: usize = 1 << 24;
 
@@ -34,10 +39,12 @@ pub const MOST_POINTS: usize = 1 << 24;
 pub const OK: i32 = 0;
 /// lyon could not fill the contours.
 pub const FAILED: i32 = -1;
-/// The input was refused: a coordinate not finite or past the range, or `ends` not closing
+/// The input was refused: a coordinate not finite, past ±1e30 or more than 838,860.8 from the
+/// centre of the points' box, or `ends` not closing
 /// contours of at least one point each that use every point.
 pub const REFUSED: i32 = -2;
-/// The allocator ran out of memory for the output.
+/// The allocator ran out of memory for the crate's own buffers. lyon's own allocations trap
+/// instead.
 pub const NO_MEMORY: i32 = -3;
 
 #[cfg(not(test))]
@@ -143,13 +150,20 @@ impl Iterator for Events<'_> {
     }
 }
 
-/// Positions back in the input's unit.
-struct Unscaled;
+/// Positions back in the input's unit and place, in f64 before they narrow to f32.
+struct Unscaled {
+    scale: f64,
+    x: f64,
+    y: f64,
+}
 
 impl FillVertexConstructor<[f32; 2]> for Unscaled {
     fn new_vertex(&mut self, vertex: FillVertex) -> [f32; 2] {
         let p = vertex.position();
-        [p.x / SCALE as f32, p.y / SCALE as f32]
+        [
+            (p.x as f64 / self.scale + self.x) as f32,
+            (p.y as f64 / self.scale + self.y) as f32,
+        ]
     }
 }
 
@@ -178,21 +192,45 @@ fn closes(ends: &[u32], count: usize) -> bool {
 /// Fills the contours of `coords`, x and y a point, each ending at its point in `ends`, under the
 /// non-zero rule or else the even-odd one. Errors are the status codes.
 pub fn fill(coords: &[f64], ends: &[u32], nonzero: bool) -> Result<Triangles, i32> {
-    fill_at(coords, ends, nonzero, SCALE)
+    fill_at(coords, ends, nonzero, SCALE, true)
 }
 
-fn fill_at(coords: &[f64], ends: &[u32], nonzero: bool, scale: f64) -> Result<Triangles, i32> {
+fn fill_at(
+    coords: &[f64],
+    ends: &[u32],
+    nonzero: bool,
+    scale: f64,
+    centred: bool,
+) -> Result<Triangles, i32> {
     let count = coords.len() / 2;
     if coords.len() % 2 != 0 || count > MOST_POINTS || !closes(ends, count) {
         return Err(REFUSED);
     }
 
+    let (mut left, mut right) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut top, mut bottom) = (f64::INFINITY, f64::NEG_INFINITY);
+    for pair in coords.chunks_exact(2) {
+        // NaN fails the comparison.
+        if !(pair[0].abs() <= FARTHEST && pair[1].abs() <= FARTHEST) {
+            return Err(REFUSED);
+        }
+
+        left = left.min(pair[0]);
+        right = right.max(pair[0]);
+        top = top.min(pair[1]);
+        bottom = bottom.max(pair[1]);
+    }
+
+    let (cx, cy) = if centred && count > 0 {
+        ((left + right) / 2.0, (top + bottom) / 2.0)
+    } else {
+        (0.0, 0.0)
+    };
     let mut points: Vec<Point> = Vec::new();
     points.try_reserve_exact(count).map_err(|_| NO_MEMORY)?;
     for pair in coords.chunks_exact(2) {
-        let x = pair[0] * scale;
-        let y = pair[1] * scale;
-        // NaN fails both comparisons.
+        let x = (pair[0] - cx) * scale;
+        let y = (pair[1] - cy) * scale;
         if !(x.abs() <= LIMIT && y.abs() <= LIMIT) {
             return Err(REFUSED);
         }
@@ -225,7 +263,14 @@ fn fill_at(coords: &[f64], ends: &[u32], nonzero: bool, scale: f64) -> Result<Tr
     };
     // The tolerance flattens curves, and the contours have none.
     let options = FillOptions::tolerance(0.02).with_fill_rule(rule);
-    let mut builder = BuffersBuilder::new(&mut output, Unscaled);
+    let mut builder = BuffersBuilder::new(
+        &mut output,
+        Unscaled {
+            scale,
+            x: cx,
+            y: cy,
+        },
+    );
     if FillTessellator::new()
         .tessellate(events, &options, &mut builder)
         .is_err()

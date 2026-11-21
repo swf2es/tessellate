@@ -23,14 +23,23 @@ int32_t lyon_fill(const double *coords, size_t count,
 - On success it returns 0, with `*positions` pointing at `*vertices` pairs of
   f32s and `*indices` at `*index_count` u32s, three a triangle.
 - Otherwise it returns -1 where lyon could not fill the contours, -2 where it
-  refused the input (a coordinate not finite or past ±838,860.8, `ends` that
-  do not close the points, a rule other than 0 or 1), or -3 where memory for
-  the output ran out; the outputs are left alone.
+  refused the input (a coordinate not finite, past ±1e30 or more than
+  838,860.8 from the centre of the points' box, `ends` that do not close the
+  points, a rule other than 0 or 1), or -3 where memory for the crate's own
+  buffers (the points and the output's first reservation) ran out; the outputs
+  are left alone. An allocation lyon makes itself that fails traps instead,
+  as a panic does (below): -3 does not cover running out of memory in lyon.
 
-The points are filled in twentieths of their unit, twips where they are
-pixels, and the positions given back in the unit again: lyon's epsilons are
-absolute, and at pixel scale they drop sub-pixel slivers. A whole number of
-twips is exact in f32 up to 2^24, which is where the range comes from.
+The points are filled about the centre of their box, in twentieths of their
+unit, twips where they are pixels, and the positions given back in their unit
+and place again, added up in f64 before they narrow to f32. lyon's epsilons are
+absolute: at pixel scale they drop sub-pixel slivers, and far from the origin
+f32 keeps too few bits of each coordinate, so that contours that come within
+hundredths of a pixel of each other, as a morph's near-identical outlines do,
+were filled wrongly under the even-odd rule before 0.1.1 centred them. A whole
+number of twips is exact in f32 up to 2^24, which is where the range comes
+from. lyon can still fill such contours wrongly where they come closer still,
+so swf2es checks what it gives back (below).
 
 The library imports nothing but `malloc`, `realloc` and `free`, through which
 Rust's global allocator goes, and the stack pointer; the module it is linked
@@ -49,7 +58,9 @@ Zig render sources (`packages/native`), and its `build.zig` links it into the
 render module with `addObjectFile`. A fill goes to lyon only where a count of
 its contours' crossings says libtess2 would be slow; every other fill stays
 with libtess2, which fills a few self-crossing even-odd shapes correctly that
-lyon covers twice in places.
+lyon covers twice in places. swf2es also checks lyon's triangles along a set of
+scanlines against the contours' winding before it draws them, and fills with
+libtess2 instead where they disagree.
 
 ## Building
 

@@ -134,17 +134,22 @@ fn star() -> Vec<[f64; 2]> {
 
 /// `count` wobbly ellipses of `points` each, every one turned a little from the last.
 fn deck(count: usize, points: usize) -> Vec<Vec<[f64; 2]>> {
+    deck_at(count, points, 0.004, 300.0)
+}
+
+/// A deck turned `turn` a contour, about (`centre`, `centre`).
+fn deck_at(count: usize, points: usize, turn: f64, centre: f64) -> Vec<Vec<[f64; 2]>> {
     (0..count)
         .map(|c| {
-            let a = c as f64 * 0.004;
+            let a = c as f64 * turn;
             (0..points)
                 .map(|k| {
                     let u = k as f64 / points as f64 * PI * 2.0;
                     let r = 200.0 + 12.0 * (u * 9.0).sin();
                     let (x, y) = (r * u.cos() * 0.7, r * u.sin());
                     [
-                        300.0 + x * a.cos() - y * a.sin(),
-                        300.0 + x * a.sin() + y * a.cos(),
+                        centre + x * a.cos() - y * a.sin(),
+                        centre + x * a.sin() + y * a.cos(),
                     ]
                 })
                 .collect()
@@ -219,16 +224,50 @@ fn fills_a_dense_deck_in_good_time() {
 #[test]
 fn refuses_what_is_not_finite_or_in_range() {
     let good = [0.0, 0.0, 10.0, 0.0, 10.0, 10.0];
-    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e7, -838_861.0] {
+    // Not finite, past f32's range, or a box wider than twips reach either side of its centre.
+    for bad in [
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        1e31,
+        1_677_730.0,
+    ] {
         let mut coords = good;
         coords[3] = bad;
         assert_eq!(fill(&coords, &[3], false).unwrap_err(), REFUSED, "{bad}");
     }
 
-    // The largest coordinate that fits in twips is taken.
+    // The widest box twips reach is taken, and so is one far from the origin.
     let mut coords = good;
-    coords[2] = 838_860.0;
+    coords[2] = 1_677_720.0;
     assert!(fill(&coords, &[3], false).is_ok());
+    let far = good.map(|v| v + 1e9);
+    let t = fill(&far, &[3], false).unwrap();
+    assert!(t.positions.iter().all(|&p| (p as f64 - 1e9).abs() <= 128.0));
+}
+
+/// Contours that come within hundredths of a pixel of each other, even-odd above all, which lyon
+/// fills wrongly in twips far from the origin: filled about their box's centre, they come out
+/// right, and the same wherever they are.
+#[test]
+fn fills_converging_decks_anywhere() {
+    for turn in [1e-5, 1e-4, 2e-4, 5e-4, 1e-3] {
+        let near = deck_at(40, 200, turn, 400.0);
+        let far = deck_at(40, 200, turn, 4000.0);
+        for nonzero in [false, true] {
+            let t = tessellate(&near, nonzero);
+            check_coverage(&near, nonzero, &t, 40);
+            let moved = tessellate(&far, nonzero);
+            check_coverage(&far, nonzero, &moved, 40);
+            // The same but for positions narrowed to f32, which at 4,000 px are a quarter of a
+            // thousandth of a pixel apart: a tenth of the gaps between contours turned 1e-5.
+            let (a, b) = (area(&t), area(&moved));
+            assert!(
+                (a - b).abs() <= 0.02 * a.max(1.0),
+                "turn {turn}: {a} against {b}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -299,15 +338,17 @@ fn the_c_function_checks_its_arguments() {
     assert_eq!(points, [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0]]);
 }
 
-/// A sliver a sixtieth of a pixel wide: lyon's absolute epsilons lose it filled in pixels,
-/// which is why the crate fills in twips.
+/// A sliver whose first edge is a hundredth of a pixel long: lyon's absolute epsilons lose it
+/// filled in pixels, which is why the crate fills in twips.
 #[test]
 fn keeps_a_sub_pixel_sliver() {
-    let contours = [vec![[0.0, 0.0], [40.0, 0.0], [40.0, 1.0 / 60.0]]];
+    let contours = [vec![[0.0, 0.0], [0.01, 0.003], [100.0, 60.0]]];
     let (coords, ends) = join(&contours);
-    let expected = 40.0 / 60.0 / 2.0;
+    let expected = (0.01 * 60.0 - 0.003 * 100.0) / 2.0;
     let twips = fill(&coords, &ends, false).unwrap();
     assert!((area(&twips) - expected).abs() < 1e-3 * expected);
-    let pixels = fill_at(&coords, &ends, false, 1.0).unwrap();
+    let pixels = fill_at(&coords, &ends, false, 1.0, false).unwrap();
     assert!(area(&pixels) < expected / 2.0, "{}", area(&pixels));
+    let centred_pixels = fill_at(&coords, &ends, false, 1.0, true).unwrap();
+    assert!(area(&centred_pixels) < expected / 2.0);
 }
